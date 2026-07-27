@@ -1,0 +1,4 @@
+username;password;email;role
+jdupont;MotDePasse1;jdupont@exemple.fr;vendeur
+mmartin;MotDePasse2;mmartin@exemple.fr;responsable
+compta1;MotDePasse3;compta@exemple.fr;comptabilite

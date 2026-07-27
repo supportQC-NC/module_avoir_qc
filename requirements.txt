@@ -1,0 +1,29 @@
+# Requirements pour Module Avoirs Quincaillerie Calédonienne
+# Version 1.3 - XPF, Email design, Export Excel
+
+# PDF Generation
+reportlab==4.0.7
+Pillow==10.1.0
+
+# Date Picker Widget (Interface calendrier)
+tkcalendar==1.6.1
+babel==2.13.1  # Dépendance pour tkcalendar
+
+# Export Excel
+openpyxl==3.1.2  # Pour générer des fichiers Excel
+
+# Installation complète:
+# pip install -r requirements.txt
+
+# Vérification de l'installation:
+# python -c "import reportlab; import PIL; import tkcalendar; import openpyxl; print('✅ Tout est installé!')"
+
+# Notes:
+# - tkinter est inclus avec Python (ne pas installer via pip)
+# - sqlite3 est inclus avec Python
+# - re (regex) est inclus avec Python
+# - Si erreur avec Pillow sur Windows: pip install --upgrade Pillow
+
+# Pour les développeurs:
+# - Python 3.8+ recommandé
+# - Windows/Linux/Mac compatible
