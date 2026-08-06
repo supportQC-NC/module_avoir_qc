@@ -862,3 +862,24 @@ class UserManager:
         except Exception as e:
             print(f"Erreur lors de la récupération des responsables: {e}")
             return []
+
+    def get_active_usernames(self):
+        """
+        Récupère les noms d'utilisateur (username) de TOUS les comptes ACTIFS.
+
+        Utilisé pour alimenter le menu déroulant de la fenêtre de connexion,
+        afin que l'utilisateur choisisse son nom au lieu de le saisir.
+
+        Returns:
+            list: Liste des usernames (str), triés par ordre alphabétique
+        """
+        try:
+            rows = self.db.cursor.execute(
+                "SELECT username FROM users "
+                "WHERE is_active = 1 "
+                "ORDER BY username COLLATE NOCASE ASC"
+            ).fetchall()
+            return [row[0] for row in rows if row and row[0]]
+        except Exception as e:
+            print(f"Erreur lors de la récupération des utilisateurs: {e}")
+            return []

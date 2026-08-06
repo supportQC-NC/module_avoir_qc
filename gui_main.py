@@ -1337,14 +1337,32 @@ class MainWindow:
         form_frame = tk.Frame(form_card, bg=self.colors['white'])
         form_frame.pack(pady=30, padx=40, fill='both', expand=True)
         
-        # Titre du formulaire
+        # Titre du formulaire + numero d'avoir qui va etre cree (a cote du titre)
+        title_frame = tk.Frame(form_frame, bg=self.colors['white'])
+        title_frame.pack(pady=(0, 20))
+
         tk.Label(
-            form_frame,
+            title_frame,
             text="Nouveau Bon d'Avoir",
             font=('Segoe UI', 18, 'bold'),
             bg=self.colors['white'],
             fg=self.colors['text_primary']
-        ).pack(pady=(0, 20))
+        ).pack(side='left')
+
+        # Numero d'avoir previsionnel (le prochain numero disponible au moment de l'ouverture)
+        try:
+            self.numero_avoir_prevu = self.avoir_manager.generate_numero_avoir()
+        except Exception:
+            self.numero_avoir_prevu = None
+
+        self.numero_avoir_label = tk.Label(
+            title_frame,
+            text=(f"N° {self.numero_avoir_prevu}" if self.numero_avoir_prevu else ""),
+            font=('Segoe UI', 13, 'bold'),
+            bg=self.colors['white'],
+            fg=self.colors['secondary']
+        )
+        self.numero_avoir_label.pack(side='left', padx=(12, 0), pady=(6, 0))
         
         # Champs du formulaire
         self.avoir_entries = {}
@@ -1413,13 +1431,13 @@ class MainWindow:
                 bg=self.colors['white'], fg=self.colors['text_secondary']
             ).pack(anchor='w')
         
-        # N facture avoir : place juste apres la date de facture achat
-        _add_field(left_col, 'numero_facture_avoir', "N facture avoir")
-        
         # ===== COLONNE DROITE : Details + Signature =====
         self.create_form_section(right_col, " Details de l'Avoir")
         montant_entry = _add_field(right_col, 'montant', "Montant TTC (XPF) *")
         montant_entry.bind('<FocusOut>', lambda e: self.validate_montant(e, 'montant'))
+
+        # N facture avoir : place dans les details de l'avoir, sous le montant TTC
+        _add_field(right_col, 'numero_facture_avoir', "N facture avoir")
         
         # Option email
         email_option = tk.Frame(right_col, bg=self.colors['white'])
@@ -1609,11 +1627,42 @@ class MainWindow:
                 }
                 
                 # Validation des champs obligatoires
-                if not all([data['numero_client'], data['nom_client'], 
+                if not all([data['numero_client'], data['nom_client'],
                         data['numero_facture'], data['montant']]):
                     messagebox.showerror("Erreur", "Tous les champs obligatoires doivent etre remplis")
                     return
-                
+
+                # Verifier que le numero d'avoir previsionnel n'a pas change
+                # (un autre utilisateur a pu creer un avoir entre l'ouverture du
+                #  formulaire et la validation, ce qui decale le numero).
+                try:
+                    numero_actuel = self.avoir_manager.generate_numero_avoir()
+                except Exception:
+                    numero_actuel = None
+
+                if (numero_actuel and getattr(self, 'numero_avoir_prevu', None)
+                        and numero_actuel != self.numero_avoir_prevu):
+                    ancien_numero = self.numero_avoir_prevu
+                    # Mettre a jour le numero previsionnel et son affichage
+                    self.numero_avoir_prevu = numero_actuel
+                    if hasattr(self, 'numero_avoir_label'):
+                        try:
+                            self.numero_avoir_label.config(text=f"N° {numero_actuel}")
+                        except Exception:
+                            pass
+
+                    continuer = messagebox.askokcancel(
+                        "Numero d'avoir modifie",
+                        f"Attention : le numero de votre bon d'avoir a change.\n\n"
+                        f"Un autre avoir a ete cree entre-temps.\n"
+                        f"Ancien numero prevu : {ancien_numero}\n"
+                        f"Nouveau numero      : {numero_actuel}\n\n"
+                        f"Voulez-vous continuer la creation avec le nouveau numero ?"
+                    )
+                    if not continuer:
+                        self.update_status("Creation annulee (numero d'avoir modifie)")
+                        return
+
                 # Creation de l'avoir
                 self.update_status("Creation de l'avoir en cours...")
                 numero_avoir = self.avoir_manager.create_avoir(data)

@@ -12,7 +12,7 @@ Fenêtre de connexion avec:
 """
 
 import tkinter as tk
-from tkinter import messagebox
+from tkinter import messagebox, ttk
 import os
 
 from database.connection import Database
@@ -106,13 +106,32 @@ class LoginWindow:
         form_frame = tk.Frame(center_frame, bg='white')
         form_frame.pack(pady=10)
         
-        # Username
+        # Username (menu déroulant des utilisateurs disponibles)
         user_frame = tk.Frame(form_frame, bg='white')
         user_frame.grid(row=0, column=0, columnspan=2, pady=5)
         tk.Label(user_frame, text="User:", font=('Arial', 10), bg='white').pack(side='left', padx=(0, 5))
-        self.username_entry = tk.Entry(user_frame, width=20, font=('Arial', 12), relief='solid', bd=1)
-        self.username_entry.pack(side='left')
-        self.username_entry.focus()
+
+        # Récupérer la liste des utilisateurs actifs pour le menu déroulant
+        try:
+            usernames = self.user_manager.get_active_usernames()
+        except Exception:
+            usernames = []
+
+        self.username_var = tk.StringVar()
+        self.username_combo = ttk.Combobox(
+            user_frame,
+            textvariable=self.username_var,
+            values=usernames,
+            width=18,
+            font=('Arial', 12),
+            state='readonly'
+        )
+        self.username_combo.pack(side='left')
+        # Quand un utilisateur est choisi, placer le focus sur le mot de passe
+        self.username_combo.bind(
+            '<<ComboboxSelected>>',
+            lambda e: self.password_entry.focus()
+        )
         
         # Password
         pass_frame = tk.Frame(form_frame, bg='white')
@@ -120,7 +139,10 @@ class LoginWindow:
         tk.Label(pass_frame, text="Pass:", font=('Arial', 10), bg='white').pack(side='left', padx=(0, 5))
         self.password_entry = tk.Entry(pass_frame, width=20, show='•', font=('Arial', 12), relief='solid', bd=1)
         self.password_entry.pack(side='left')
-        
+
+        # Focus initial sur le menu déroulant des utilisateurs
+        self.username_combo.focus()
+
         # Bouton connexion
         login_button = tk.Button(form_frame, text="SE CONNECTER", 
                                 command=self.login,
@@ -202,11 +224,15 @@ class LoginWindow:
     
     def login(self):
         """Gère la connexion de l'utilisateur."""
-        username = self.username_entry.get().strip()
+        username = self.username_var.get().strip()
         password = self.password_entry.get()
-        
-        if not username or not password:
-            self.show_error("Veuillez remplir tous les champs")
+
+        if not username:
+            self.show_error("Veuillez sélectionner un utilisateur")
+            return
+
+        if not password:
+            self.show_error("Veuillez saisir votre mot de passe")
             return
         
         # Afficher un message de connexion en cours
