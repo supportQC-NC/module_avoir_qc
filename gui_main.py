@@ -33,6 +33,14 @@ except ImportError:
     DATEPICKER_AVAILABLE = False
     print(" Module tkcalendar non installe. Installation: pip install tkcalendar")
 
+def format_montant_simple(montant):
+    """Formate un montant en XPF (espace comme separateur de milliers)"""
+    try:
+        return f"{float(montant or 0):,.0f} XPF".replace(',', ' ')
+    except (TypeError, ValueError):
+        return "0 XPF"
+
+
 class ModernButton(tk.Button):
     """Bouton personnalise avec effets modernes"""
     def __init__(self, parent, **kwargs):
@@ -319,6 +327,664 @@ class UtilisationDialog:
         """Annule l'operation"""
         self.result = None
         self.dialog.destroy()
+
+class MultiAvoirDialog:
+    """
+    Dialogue d'utilisation de PLUSIEURS avoirs cumules sur une meme facture.
+
+    Le vendeur scanne / saisit plusieurs bons d'avoir (les clients peuvent etre
+    DIFFERENTS), leurs montants restants sont cumules, puis imputes sur une
+    seule et meme facture.
+
+    Regles appliquees :
+      - Les avoirs sont consommes dans l'ordre de la liste.
+      - Si le total des avoirs > montant de la facture, le dernier avoir
+        partiellement consomme genere automatiquement un avoir residu (enfant).
+      - Si le total des avoirs < montant de la facture, tous les avoirs sont
+        consommes et le client regle la difference.
+      - Un avoir expire ne peut etre utilise que par forcage (selection du
+        responsable ayant autorise, comme pour l'utilisation simple).
+      - Les avoirs utilises / bloques / annules / supprimes sont refuses.
+    """
+
+    def __init__(self, parent, avoir_manager, responsables=None):
+        self.result = None
+        self.avoir_manager = avoir_manager
+        # Responsables autorises a valider un forcage (avoirs expires)
+        self.responsables = responsables or []
+        # Liste des avoirs retenus : dict(numero, client, montant_restant, expire)
+        self.avoirs = []
+        # Le cadre de forcage n'est affiche que si un avoir expire est ajoute
+        self.forcage_affiche = False
+
+        self.dialog = tk.Toplevel(parent)
+        self.dialog.title("Utilisation de plusieurs avoirs")
+        self.dialog.geometry("780x700")
+        self.dialog.transient(parent)
+        self.dialog.grab_set()
+
+        # Centrer la fenetre
+        self.dialog.update_idletasks()
+        x = max(0, (self.dialog.winfo_screenwidth() // 2) - 390)
+        y = max(0, (self.dialog.winfo_screenheight() // 2) - 350)
+        self.dialog.geometry(f'+{x}+{y}')
+
+        self.create_interface()
+
+        # Meme correctif de focus que pour l'utilisation simple : sur certains
+        # postes le focus clavier ne passe pas automatiquement a la modale.
+        self._forcer_focus_saisie()
+
+    def _forcer_focus_saisie(self):
+        """Donne le focus clavier a la fenetre et au champ de scan."""
+        def _appliquer():
+            try:
+                if not self.dialog.winfo_exists():
+                    return
+                self.dialog.lift()
+                self.dialog.focus_force()
+                if hasattr(self, 'scan_entry') and self.scan_entry.winfo_exists():
+                    self.scan_entry.focus_set()
+            except Exception:
+                pass
+        _appliquer()
+        try:
+            self.dialog.after(150, _appliquer)
+            self.dialog.after(400, _appliquer)
+        except Exception:
+            pass
+
+    # ------------------------------------------------------------------
+    # INTERFACE
+    # ------------------------------------------------------------------
+    def create_interface(self):
+        """Construit l'interface du dialogue multi-avoirs"""
+        # Header
+        header_frame = tk.Frame(self.dialog, bg='#fff001', height=50)
+        header_frame.pack(fill='x')
+        header_frame.pack_propagate(False)
+
+        tk.Label(
+            header_frame,
+            text="Utilisation de plusieurs avoirs (cumul)",
+            font=('Segoe UI', 14, 'bold'),
+            bg='#fff001',
+            fg='#000000'
+        ).pack(pady=15)
+
+        main_frame = tk.Frame(self.dialog, bg='white', padx=25, pady=15)
+        main_frame.pack(fill='both', expand=True)
+
+        # ---------------- Zone de scan / ajout ----------------
+        scan_frame = tk.Frame(main_frame, bg='white')
+        scan_frame.pack(fill='x')
+
+        tk.Label(
+            scan_frame,
+            text="Scanner ou saisir un numero d'avoir, puis 'Ajouter' :",
+            font=('Segoe UI', 10),
+            bg='white',
+            fg='#212121'
+        ).pack(anchor='w')
+
+        scan_row = tk.Frame(scan_frame, bg='white')
+        scan_row.pack(fill='x', pady=(5, 10))
+
+        self.scan_entry = tk.Entry(
+            scan_row,
+            font=('Segoe UI', 12),
+            bd=1,
+            relief='solid'
+        )
+        self.scan_entry.pack(side='left', fill='x', expand=True, ipady=4)
+        self.scan_entry.bind('<Return>', lambda e: self.add_avoir())
+
+        tk.Button(
+            scan_row,
+            text="+ Ajouter",
+            command=self.add_avoir,
+            font=('Segoe UI', 10, 'bold'),
+            bg='#2196F3',
+            fg='white',
+            bd=0,
+            cursor='hand2',
+            padx=15,
+            pady=5
+        ).pack(side='left', padx=(10, 0))
+
+        # ---------------- Liste des avoirs ----------------
+        liste_frame = tk.Frame(main_frame, bg='white')
+        liste_frame.pack(fill='both', expand=True)
+
+        columns = ('numero', 'client', 'montant', 'etat')
+        self.tree = ttk.Treeview(
+            liste_frame,
+            columns=columns,
+            show='headings',
+            height=7
+        )
+        self.tree.heading('numero', text="N Avoir")
+        self.tree.heading('client', text="Client")
+        self.tree.heading('montant', text="Montant restant")
+        self.tree.heading('etat', text="Etat")
+        self.tree.column('numero', width=110, anchor='center')
+        self.tree.column('client', width=280, anchor='w')
+        self.tree.column('montant', width=140, anchor='e')
+        self.tree.column('etat', width=150, anchor='center')
+
+        scroll = ttk.Scrollbar(liste_frame, orient='vertical', command=self.tree.yview)
+        self.tree.configure(yscrollcommand=scroll.set)
+        self.tree.pack(side='left', fill='both', expand=True)
+        scroll.pack(side='right', fill='y')
+
+        # Les avoirs expires (forcage necessaire) apparaissent en rouge
+        self.tree.tag_configure('expire', foreground='#c62828')
+
+        actions_frame = tk.Frame(main_frame, bg='white')
+        actions_frame.pack(fill='x', pady=(8, 0))
+
+        tk.Button(
+            actions_frame,
+            text="Retirer de la liste",
+            command=self.remove_avoir,
+            font=('Segoe UI', 9, 'bold'),
+            bg='#9e9e9e',
+            fg='white',
+            bd=0,
+            cursor='hand2',
+            padx=12,
+            pady=4
+        ).pack(side='left')
+
+        tk.Button(
+            actions_frame,
+            text="Vider la liste",
+            command=self.clear_avoirs,
+            font=('Segoe UI', 9, 'bold'),
+            bg='#9e9e9e',
+            fg='white',
+            bd=0,
+            cursor='hand2',
+            padx=12,
+            pady=4
+        ).pack(side='left', padx=(8, 0))
+
+        self.total_label = tk.Label(
+            actions_frame,
+            text="Total des avoirs : 0 XPF  (0 avoir)",
+            font=('Segoe UI', 12, 'bold'),
+            bg='white',
+            fg='#4CAF50'
+        )
+        self.total_label.pack(side='right')
+
+        # ---------------- Facture ----------------
+        facture_frame = tk.Frame(main_frame, bg='white')
+        facture_frame.pack(fill='x', pady=(12, 0))
+
+        col_gauche = tk.Frame(facture_frame, bg='white')
+        col_gauche.pack(side='left', fill='x', expand=True, padx=(0, 10))
+
+        tk.Label(
+            col_gauche,
+            text="Numero de facture : *",
+            font=('Segoe UI', 10),
+            bg='white',
+            fg='#f44336'
+        ).pack(anchor='w')
+
+        self.facture_entry = tk.Entry(
+            col_gauche,
+            font=('Segoe UI', 11),
+            bd=1,
+            relief='solid'
+        )
+        self.facture_entry.pack(fill='x', pady=(3, 0))
+
+        col_droite = tk.Frame(facture_frame, bg='white')
+        col_droite.pack(side='left', fill='x', expand=True)
+
+        tk.Label(
+            col_droite,
+            text="Montant de la facture (XPF) : *",
+            font=('Segoe UI', 10),
+            bg='white',
+            fg='#f44336'
+        ).pack(anchor='w')
+
+        self.montant_entry = tk.Entry(
+            col_droite,
+            font=('Segoe UI', 11),
+            bd=1,
+            relief='solid'
+        )
+        self.montant_entry.pack(fill='x', pady=(3, 0))
+        self.montant_entry.bind('<KeyRelease>', lambda e: self.update_recap())
+
+        # ---------------- Forcage (avoirs expires) ----------------
+        # Cadre cree une seule fois, affiche uniquement si la liste contient
+        # au moins un avoir expire.
+        self.forcage_frame = tk.Frame(main_frame, bg='#ffebee', relief='solid', bd=1)
+        tk.Label(
+            self.forcage_frame,
+            text="Un ou plusieurs avoirs de la liste sont EXPIRES.\n"
+                 "Selectionnez le responsable ayant autorise le forcage : *",
+            font=('Segoe UI', 9, 'bold'),
+            bg='#ffebee',
+            fg='#c62828',
+            justify='left'
+        ).pack(anchor='w', padx=10, pady=(8, 0))
+
+        self.forcage_var = tk.StringVar(self.dialog, value="")
+        self.forcage_combo = ttk.Combobox(
+            self.forcage_frame,
+            textvariable=self.forcage_var,
+            values=self.responsables,
+            state='readonly',
+            font=('Segoe UI', 11)
+        )
+        self.forcage_combo.pack(fill='x', padx=10, pady=(5, 8))
+
+        # ---------------- Recapitulatif ----------------
+        self.recap_frame = tk.Frame(main_frame, bg='#e3f2fd')
+        self.recap_frame.pack(fill='x', pady=(12, 0))
+
+        self.recap_label = tk.Label(
+            self.recap_frame,
+            text="Ajoutez les avoirs a cumuler puis saisissez le montant de la facture.",
+            font=('Segoe UI', 10),
+            bg='#e3f2fd',
+            fg='#1976d2',
+            wraplength=680,
+            justify='left'
+        )
+        self.recap_label.pack(padx=10, pady=8, anchor='w')
+
+        # ---------------- Boutons ----------------
+        button_frame = tk.Frame(main_frame, bg='white')
+        button_frame.pack(side='bottom', fill='x', pady=(15, 0))
+
+        tk.Button(
+            button_frame,
+            text="Valider l'utilisation",
+            command=self.validate,
+            font=('Segoe UI', 10, 'bold'),
+            bg='#4CAF50',
+            fg='white',
+            bd=0,
+            cursor='hand2',
+            padx=20,
+            pady=10
+        ).pack(side='right', padx=(10, 0))
+
+        tk.Button(
+            button_frame,
+            text="Annuler",
+            command=self.cancel,
+            font=('Segoe UI', 10, 'bold'),
+            bg='#f44336',
+            fg='white',
+            bd=0,
+            cursor='hand2',
+            padx=20,
+            pady=10
+        ).pack(side='right')
+
+        self.scan_entry.focus()
+
+    # ------------------------------------------------------------------
+    # GESTION DE LA LISTE
+    # ------------------------------------------------------------------
+    def add_avoir(self):
+        """Controle puis ajoute un avoir a la liste cumulee"""
+        saisie = self.scan_entry.get().strip()
+        if not saisie:
+            return
+
+        # Meme reconnaissance de code-barres que pour l'utilisation simple
+        numero_avoir = saisie
+        if '/' not in saisie and len(saisie) == 7:
+            numero_avoir = f"{saisie[:2]}/{saisie[2:]}"
+
+        details = self.avoir_manager.get_avoir_details(numero_avoir)
+        if not details:
+            messagebox.showerror(
+                " AVOIR INTROUVABLE",
+                f"L'avoir {numero_avoir} n'existe pas!\n\n"
+                f"Verifiez le numero saisi ou le code-barres scanne.",
+                parent=self.dialog
+            )
+            self._reset_scan()
+            return
+
+        avoir = details if not isinstance(details, dict) else details['avoir']
+        numero_reel = avoir[1]
+
+        # Doublon ?
+        if any(a['numero'] == numero_reel for a in self.avoirs):
+            messagebox.showwarning(
+                "Avoir deja dans la liste",
+                f"L'avoir {numero_reel} est deja present dans la liste.",
+                parent=self.dialog
+            )
+            self._reset_scan()
+            return
+
+        statut = avoir[12]
+
+        if statut == AVOIR_STATUS['UTILISE']:
+            messagebox.showerror(
+                " AVOIR DEJA UTILISE",
+                f"ERREUR : L'avoir {numero_reel} a deja ete utilise!\n\n"
+                f"Cet avoir ne peut pas etre valide une seconde fois.",
+                parent=self.dialog
+            )
+            self._reset_scan()
+            return
+
+        if statut == AVOIR_STATUS['BLOQUE']:
+            messagebox.showwarning(
+                " AVOIR BLOQUE",
+                f"L'avoir {numero_reel} est BLOQUE.\n\n"
+                f"Demandez au client de passer a la COMPTABILITE.",
+                parent=self.dialog
+            )
+            self._reset_scan()
+            return
+
+        if statut == AVOIR_STATUS['SUPPRIME']:
+            motif = avoir[25] if (len(avoir) > 25 and avoir[25]) else ''
+            message = (f"L'avoir {numero_reel} a ete SUPPRIME.\n\n"
+                       f"Il ne peut plus etre utilise.")
+            if motif:
+                message += f"\n\nMotif : {motif}"
+            messagebox.showwarning(" AVOIR SUPPRIME", message, parent=self.dialog)
+            self._reset_scan()
+            return
+
+        if statut == AVOIR_STATUS['ANNULE']:
+            motif = avoir[25] if (len(avoir) > 25 and avoir[25]) else ''
+            annule_par = avoir[26] if (len(avoir) > 26 and avoir[26]) else ''
+            message = (f"L'avoir {numero_reel} a ete ANNULE.\n\n"
+                       f"Il ne peut plus etre utilise.")
+            if annule_par:
+                message += f"\n\nAnnule par : {annule_par}"
+            if motif:
+                message += f"\nMotif : {motif}"
+            messagebox.showwarning(" AVOIR ANNULE", message, parent=self.dialog)
+            self._reset_scan()
+            return
+
+        # Montant encore disponible sur l'avoir
+        montant_restant = avoir[20] if avoir[20] is not None else avoir[8]
+        try:
+            montant_restant = float(montant_restant or 0)
+        except (TypeError, ValueError):
+            montant_restant = 0
+
+        if montant_restant <= 0:
+            messagebox.showwarning(
+                "Solde nul",
+                f"L'avoir {numero_reel} n'a plus de solde disponible.",
+                parent=self.dialog
+            )
+            self._reset_scan()
+            return
+
+        # Expiration : meme regle metier que l'utilisation simple (90 jours
+        # apres la date de creation). Necessite un forcage par un responsable.
+        expire = self.avoir_manager.is_avoir_expire(avoir)
+        if expire and not self.responsables:
+            messagebox.showerror(
+                " AVOIR EXPIRE",
+                f"L'avoir {numero_reel} est expire et aucun responsable actif "
+                f"n'est disponible pour autoriser un forcage.",
+                parent=self.dialog
+            )
+            self._reset_scan()
+            return
+
+        self.avoirs.append({
+            'numero': numero_reel,
+            'numero_client': avoir[2] or '',
+            'client': avoir[3] or '',
+            'montant_restant': montant_restant,
+            'expire': bool(expire)
+        })
+
+        self._reset_scan()
+        self.refresh_liste()
+
+    def remove_avoir(self):
+        """Retire le ou les avoirs selectionnes de la liste"""
+        selection = self.tree.selection()
+        if not selection:
+            messagebox.showinfo(
+                "Aucune selection",
+                "Selectionnez d'abord un avoir dans la liste.",
+                parent=self.dialog
+            )
+            return
+        numeros = {self.tree.item(item, 'values')[0] for item in selection}
+        self.avoirs = [a for a in self.avoirs if a['numero'] not in numeros]
+        self.refresh_liste()
+
+    def clear_avoirs(self):
+        """Vide completement la liste"""
+        self.avoirs = []
+        self.refresh_liste()
+
+    def _reset_scan(self):
+        """Vide le champ de scan et lui redonne le focus"""
+        try:
+            self.scan_entry.delete(0, tk.END)
+            self.scan_entry.focus_set()
+        except Exception:
+            pass
+
+    def refresh_liste(self):
+        """Redessine la liste, le total et le recapitulatif"""
+        for item in self.tree.get_children():
+            self.tree.delete(item)
+
+        for avoir in self.avoirs:
+            libelle_client = avoir['client']
+            if avoir['numero_client']:
+                libelle_client = f"{avoir['numero_client']} - {libelle_client}"
+            self.tree.insert(
+                '', 'end',
+                values=(
+                    avoir['numero'],
+                    libelle_client,
+                    format_montant_simple(avoir['montant_restant']),
+                    "EXPIRE (forcage)" if avoir['expire'] else "Utilisable"
+                ),
+                tags=('expire',) if avoir['expire'] else ()
+            )
+
+        # Afficher / masquer le cadre de forcage selon la presence d'un expire.
+        # On suit l'etat avec un indicateur (et non winfo_ismapped, qui reste
+        # a 0 tant que Tk n'a pas traite les taches d'affichage en attente).
+        doit_forcer = any(a['expire'] for a in self.avoirs)
+        if doit_forcer and not self.forcage_affiche:
+            self.forcage_frame.pack(fill='x', pady=(10, 0), before=self.recap_frame)
+            self.forcage_affiche = True
+        elif not doit_forcer and self.forcage_affiche:
+            self.forcage_frame.pack_forget()
+            self.forcage_affiche = False
+        if not doit_forcer:
+            self.forcage_var.set("")
+
+        self.update_recap()
+
+    def total_avoirs(self):
+        """Somme des montants restants des avoirs de la liste"""
+        return sum(a['montant_restant'] for a in self.avoirs)
+
+    def _lire_montant_facture(self):
+        """Retourne le montant de la facture saisi, ou None si invalide"""
+        montant_str = self.montant_entry.get().strip()
+        if not montant_str:
+            return None
+        try:
+            return float(montant_str.replace(' ', '').replace(',', '.'))
+        except ValueError:
+            return None
+
+    def update_recap(self):
+        """Met a jour le total cumule et le recapitulatif de repartition"""
+        total = self.total_avoirs()
+        nb = len(self.avoirs)
+        self.total_label.config(
+            text=f"Total des avoirs : {format_montant_simple(total)}"
+                 f"  ({nb} avoir{'s' if nb > 1 else ''})"
+        )
+
+        montant_facture = self._lire_montant_facture()
+
+        if nb == 0:
+            self.recap_frame.config(bg='#e3f2fd')
+            self.recap_label.config(
+                bg='#e3f2fd', fg='#1976d2',
+                text="Ajoutez les avoirs a cumuler puis saisissez le montant de la facture."
+            )
+            return
+
+        if montant_facture is None or montant_facture <= 0:
+            self.recap_frame.config(bg='#e3f2fd')
+            self.recap_label.config(
+                bg='#e3f2fd', fg='#1976d2',
+                text="Saisissez le montant de la facture pour voir la repartition des avoirs."
+            )
+            return
+
+        impute = min(total, montant_facture)
+        lignes = [
+            f"Facture : {format_montant_simple(montant_facture)}"
+            f"   |   Avoirs imputes : {format_montant_simple(impute)}"
+        ]
+
+        if montant_facture > total:
+            lignes.append(
+                "RESTANT A PAYER PAR LE CLIENT : "
+                f"{format_montant_simple(montant_facture - total)}"
+            )
+            bg, fg = '#fff3e0', '#e65100'
+        elif montant_facture < total:
+            lignes.append(
+                f"Un avoir residu de {format_montant_simple(total - montant_facture)} "
+                "sera cree automatiquement (a remettre au client)."
+            )
+            bg, fg = '#e8f5e9', '#2e7d32'
+        else:
+            lignes.append("Les avoirs couvrent exactement la facture. Rien a payer.")
+            bg, fg = '#e8f5e9', '#2e7d32'
+
+        # Information : avoirs de clients differents (autorise)
+        clients = {(a['numero_client'] or a['client']) for a in self.avoirs}
+        if len(clients) > 1:
+            lignes.append("Note : les avoirs de la liste appartiennent a des CLIENTS DIFFERENTS.")
+
+        self.recap_frame.config(bg=bg)
+        self.recap_label.config(bg=bg, fg=fg, text="\n".join(lignes))
+
+    # ------------------------------------------------------------------
+    # VALIDATION
+    # ------------------------------------------------------------------
+    def validate(self):
+        """Controle la saisie et prepare le resultat"""
+        if not self.avoirs:
+            messagebox.showerror(
+                "Erreur",
+                "Ajoutez au moins un avoir a la liste.",
+                parent=self.dialog
+            )
+            self.scan_entry.focus()
+            return
+
+        numero_facture = self.facture_entry.get().strip()
+        if not numero_facture:
+            messagebox.showerror(
+                "Erreur",
+                "Le numero de facture est obligatoire",
+                parent=self.dialog
+            )
+            self.facture_entry.focus()
+            return
+
+        montant_facture = self._lire_montant_facture()
+        if montant_facture is None:
+            messagebox.showerror("Erreur", "Montant invalide", parent=self.dialog)
+            self.montant_entry.focus()
+            return
+        if montant_facture <= 0:
+            messagebox.showerror(
+                "Erreur", "Le montant doit etre positif", parent=self.dialog
+            )
+            self.montant_entry.focus()
+            return
+
+        # Forcage obligatoire si la liste contient au moins un avoir expire
+        forcage_autorise_par = None
+        if any(a['expire'] for a in self.avoirs):
+            forcage_autorise_par = self.forcage_var.get().strip()
+            if not forcage_autorise_par:
+                messagebox.showerror(
+                    "Forcage refuse",
+                    "La liste contient au moins un avoir expire.\n"
+                    "Vous devez selectionner le responsable ayant autorise "
+                    "le forcage pour continuer.",
+                    parent=self.dialog
+                )
+                self.forcage_combo.focus()
+                return
+
+        # Recapitulatif de confirmation avec la repartition avoir par avoir
+        reste = montant_facture
+        lignes = []
+        avoirs_non_utilises = []
+        for avoir in self.avoirs:
+            if reste <= 0:
+                avoirs_non_utilises.append(avoir['numero'])
+                continue
+            impute = min(avoir['montant_restant'], reste)
+            ligne = f"  - {avoir['numero']} : {format_montant_simple(impute)}"
+            if impute < avoir['montant_restant']:
+                solde = avoir['montant_restant'] - impute
+                ligne += f"  (residu de {format_montant_simple(solde)})"
+            if avoir['expire']:
+                ligne += "  [FORCAGE]"
+            lignes.append(ligne)
+            reste -= impute
+
+        message = (
+            f"Facture {numero_facture} : {format_montant_simple(montant_facture)}\n\n"
+            "Repartition sur les avoirs :\n" + "\n".join(lignes)
+        )
+        if reste > 0:
+            message += f"\n\nRESTANT A PAYER : {format_montant_simple(reste)}"
+        if avoirs_non_utilises:
+            message += ("\n\nAvoirs NON utilises (facture deja couverte) : "
+                        + ", ".join(avoirs_non_utilises))
+        message += "\n\nConfirmer l'utilisation de ces avoirs ?"
+
+        if not messagebox.askyesno("Confirmation", message, parent=self.dialog):
+            return
+
+        self.result = {
+            'avoirs': list(self.avoirs),
+            'montant_facture': montant_facture,
+            'numero_facture': numero_facture,
+            'total_avoirs': self.total_avoirs(),
+            'forcage_autorise_par': forcage_autorise_par
+        }
+        self.dialog.destroy()
+
+    def cancel(self):
+        """Annule l'operation"""
+        self.result = None
+        self.dialog.destroy()
+
 
 class MainWindow:
     def __init__(self, root, user):
@@ -1070,14 +1736,17 @@ class MainWindow:
         main_container = tk.Frame(self.content_frame, bg=self.colors['white'])
         main_container.pack(fill='both', expand=True, padx=40, pady=20)
         
-        # Carte centrale
+        # Carte centrale.
+        # La HAUTEUR n'est PAS figee : elle s'adapte au contenu, sinon les
+        # boutons du bas se retrouvent coupes (la carte etait limitee a 500 px
+        # alors que son contenu en demande davantage).
         card = tk.Frame(main_container, bg=self.colors['white'], relief='flat')
-        card.place(relx=0.5, rely=0.5, anchor='center', width=700, height=500)
-        
+        card.place(relx=0.5, rely=0.5, anchor='center', width=700)
+
         # Bordure coloree
         top_border = tk.Frame(card, bg=self.colors['primary'], height=5)
         top_border.pack(fill='x')
-        
+
         # Titre
         tk.Label(
             card,
@@ -1085,11 +1754,11 @@ class MainWindow:
             font=('Segoe UI', 24, 'bold'),
             bg=self.colors['white'],
             fg=self.colors['text_primary']
-        ).pack(pady=(30, 20))
-        
+        ).pack(pady=(20, 10))
+
         # Instructions
         instructions = tk.Frame(card, bg=self.colors['info'], relief='flat')
-        instructions.pack(pady=20, padx=50, fill='x')
+        instructions.pack(pady=12, padx=50, fill='x')
         
         tk.Label(
             instructions,
@@ -1113,7 +1782,7 @@ class MainWindow:
         
         # Zone de saisie
         input_frame = tk.Frame(card, bg=self.colors['white'])
-        input_frame.pack(pady=30)
+        input_frame.pack(pady=10)
         
         # Animation de scan
         scan_canvas = tk.Canvas(
@@ -1146,7 +1815,7 @@ class MainWindow:
             bd=0.2,
             relief='solid'
         )
-        self.avoir_input.pack(pady=10 , ipady=12)
+        self.avoir_input.pack(pady=6, ipady=12)
         self.avoir_input.bind('<Return>', lambda e: self.validate_avoir())
         self.avoir_input.bind('<KeyRelease>', self.detect_format)
         self.avoir_input.focus()
@@ -1161,9 +1830,12 @@ class MainWindow:
         )
         self.format_label.pack()
         
-        # Bouton de validation
+        # Boutons : validation d'un seul avoir OU cumul de plusieurs avoirs
+        buttons_row = tk.Frame(input_frame, bg=self.colors['white'])
+        buttons_row.pack(pady=14)
+
         validate_btn = tk.Button(
-            input_frame,
+            buttons_row,
             text="VALIDER",
             command=self.validate_avoir,
             font=('Segoe UI', 14, 'bold'),
@@ -1174,7 +1846,22 @@ class MainWindow:
             padx=40,
             pady=15
         )
-        validate_btn.pack(pady=20)
+        validate_btn.pack(side='left')
+
+        # Cumul de plusieurs bons d'avoir sur une meme facture
+        multi_btn = tk.Button(
+            buttons_row,
+            text="PLUSIEURS AVOIRS",
+            command=self.validate_multi_avoirs,
+            font=('Segoe UI', 14, 'bold'),
+            bg=self.colors['info'],
+            fg=self.colors['white'],
+            bd=0,
+            cursor='hand2',
+            padx=30,
+            pady=15
+        )
+        multi_btn.pack(side='left', padx=(15, 0))
     
     def validate_avoir(self):
         """Valide l'utilisation d'un avoir avec dialogue pour montant et facture"""
@@ -4272,6 +4959,278 @@ class MainWindow:
         # Reinitialiser le champ de saisie
         self.reset_avoir_input()
         
+    # ══════════════════════════════════════════════════════════════════════
+    # UTILISATION DE PLUSIEURS AVOIRS CUMULES SUR UNE MEME FACTURE
+    # ══════════════════════════════════════════════════════════════════════
+
+    def _generer_pdf_avoir_enfant(self, result):
+        """
+        Genere (et ouvre) le PDF de l'avoir residu cree lors d'une utilisation
+        partielle. Utilise par l'utilisation multi-avoirs.
+
+        Returns:
+            tuple: (succes: bool, chemin_ou_message: str)
+        """
+        try:
+            from services.pdf_creator import PDFCreator
+
+            avoir_enfant = result.get('avoir_enfant')
+            date_validite = result.get('date_validite')
+
+            if not avoir_enfant or not date_validite:
+                return False, "donnees de l'avoir enfant incompletes"
+
+            # Normaliser la date de validite (toujours une chaine JJ/MM/AAAA)
+            if isinstance(date_validite, datetime):
+                date_validite_str = date_validite.strftime('%d/%m/%Y')
+            else:
+                date_validite_str = str(date_validite).split(' ')[0].split('T')[0]
+
+            avoir_parent = result.get('avoir_parent')
+            pdf_data = {
+                'numero_client': avoir_enfant[2] or '',
+                'nom_client': avoir_enfant[3] or '',
+                'email_client': avoir_enfant[4] or '',
+                # "facture achat" = facture d'ORIGINE, heritee de l'avoir parent
+                'numero_facture': (avoir_enfant[5] or ''),
+                'date_facture': avoir_enfant[6] or '',
+                'montant': result.get('montant_restant', 0),
+                # "facture avoir" : facture saisie lors de l'utilisation
+                'numero_facture_avoir': (result.get('numero_facture') or avoir_enfant[9] or ''),
+                'date_creation': datetime.now().strftime('%d/%m/%Y'),
+                'date_validite': date_validite_str,
+                'est_residu': True,
+                'avoir_parent_numero': (avoir_parent[1] if avoir_parent else ''),
+                'avoir_parent_montant': (avoir_parent[8] if avoir_parent else None)
+            }
+
+            pdf_creator = PDFCreator()
+            success_pdf, pdf_result = pdf_creator.generate(
+                result['numero_avoir_enfant'],
+                pdf_data,
+                self.user[1]
+            )
+
+            if not success_pdf:
+                return False, str(pdf_result)
+
+            # Ouvrir le PDF automatiquement pour impression
+            try:
+                if os.name == 'nt':
+                    os.startfile(str(pdf_result))
+                elif os.name == 'posix':
+                    import subprocess
+                    subprocess.run(['xdg-open', str(pdf_result)], check=False)
+            except Exception as e:
+                print(f" Impossible d'ouvrir le PDF: {e}")
+
+            return True, str(pdf_result)
+
+        except ImportError as e:
+            print(f" Module PDFCreator introuvable: {e}")
+            return False, "module reportlab non installe"
+        except Exception as e:
+            print(f" Erreur generation PDF: {e}")
+            import traceback
+            traceback.print_exc()
+            return False, f"{type(e).__name__}: {e}"
+
+    def _envoyer_email_avoir_enfant(self, result, numero_avoir):
+        """
+        Envoie au client l'email de notification d'utilisation partielle.
+        Utilise par l'utilisation multi-avoirs.
+
+        Returns:
+            bool: True si l'email a bien ete envoye
+        """
+        try:
+            avoir_parent = result.get('avoir_parent')
+            if not avoir_parent or not avoir_parent[4] or not self.email_service:
+                return False
+
+            email_data = {
+                'numero_avoir': numero_avoir,
+                'numero_avoir_enfant': result['numero_avoir_enfant'],
+                'nom_client': avoir_parent[3],
+                'email_client': avoir_parent[4],
+                'montant_initial': avoir_parent[8],
+                'montant_utilise': result.get('montant_utilise', result.get('montant_facture', 0)),
+                'montant_restant': result['montant_restant'],
+                'numero_facture': result['numero_facture'],
+                'date_utilisation': datetime.now(),
+                'date_validite': result['date_validite']
+            }
+
+            success_email, error = self.email_service.send_utilisation_partielle_notification(email_data)
+            if not success_email:
+                print(f" Erreur email: {error}")
+            return bool(success_email)
+
+        except Exception as e:
+            print(f" Erreur envoi email: {e}")
+            return False
+
+    def validate_multi_avoirs(self):
+        """
+        Utilisation CUMULEE de plusieurs avoirs sur une seule facture.
+
+        Les avoirs sont consommes un par un, dans l'ordre de la liste, via
+        AvoirManager.use_avoir() : chaque avoir est donc trace normalement
+        (historique, logs, statut). Le dernier avoir partiellement consomme
+        genere automatiquement son avoir residu (PDF + email).
+        Les avoirs peuvent appartenir a des CLIENTS DIFFERENTS.
+        """
+        responsables_forcage = self.user_manager.get_active_usernames_by_roles(
+            [USER_ROLES['RESPONSABLE'], USER_ROLES['COMPTABILITE']]
+        )
+
+        dialog = MultiAvoirDialog(
+            self.root, self.avoir_manager, responsables=responsables_forcage
+        )
+        self.root.wait_window(dialog.dialog)
+
+        if not dialog.result:
+            return
+
+        numero_facture = dialog.result['numero_facture']
+        montant_facture = dialog.result['montant_facture']
+        forcage_autorise_par = dialog.result.get('forcage_autorise_par')
+
+        reste = montant_facture
+        total_impute = 0
+        lignes_recap = []
+        residus = []
+        erreurs = []
+        non_utilises = []
+
+        for item in dialog.result['avoirs']:
+            numero = item['numero']
+
+            # Facture deja entierement couverte : l'avoir reste intact
+            if reste <= 0:
+                non_utilises.append(numero)
+                continue
+
+            montant_impute = min(item['montant_restant'], reste)
+            self.update_status(f"Utilisation de l'avoir {numero}...")
+
+            result = self.avoir_manager.use_avoir(
+                numero,
+                self.user[1],
+                montant_impute,
+                numero_facture,
+                force=bool(item['expire']),
+                forcage_autorise_par=forcage_autorise_par if item['expire'] else None
+            )
+
+            if result.get('status') != 'success':
+                erreurs.append(f"  - {numero} : {result.get('message', 'erreur inconnue')}")
+                continue
+
+            reste -= montant_impute
+            total_impute += montant_impute
+
+            ligne = f"  - {numero} : {format_montant_simple(montant_impute)}"
+            if item['expire']:
+                ligne += "  [FORCAGE]"
+
+            # Utilisation partielle => avoir residu : PDF + email client
+            if result.get('type_utilisation') == 'partielle':
+                numero_enfant = result.get('numero_avoir_enfant')
+                montant_residu = result.get('montant_restant', 0)
+
+                pdf_ok, pdf_info = self._generer_pdf_avoir_enfant(result)
+                email_ok = self._envoyer_email_avoir_enfant(result, numero)
+
+                residus.append({
+                    'numero': numero_enfant,
+                    'montant': montant_residu,
+                    'pdf_ok': pdf_ok,
+                    'pdf_info': pdf_info,
+                    'email_ok': email_ok
+                })
+                ligne += (f"  ->  residu N{numero_enfant} de "
+                          f"{format_montant_simple(montant_residu)}")
+
+            lignes_recap.append(ligne)
+
+            self.db.add_log(
+                self.user[1],
+                "VALIDATION_AVOIR_MULTI",
+                f"Avoir {numero} - Facture: {numero_facture} - "
+                f"Impute: {format_montant_simple(montant_impute)}"
+            )
+
+        # ---------------- Aucun avoir n'a pu etre utilise ----------------
+        if not lignes_recap:
+            self.play_sound('error')
+            messagebox.showerror(
+                " ERREUR",
+                "Aucun avoir n'a pu etre utilise.\n\n" + "\n".join(erreurs)
+            )
+            self.update_status("Utilisation multi-avoirs echouee")
+            return
+
+        # ---------------- Message de synthese ----------------
+        self.play_sound('success')
+
+        message_parts = [
+            f"Facture {numero_facture} : {format_montant_simple(montant_facture)}",
+            f"Total des avoirs imputes : {format_montant_simple(total_impute)}",
+            "",
+            "Detail :",
+        ]
+        message_parts.extend(lignes_recap)
+
+        if reste > 0:
+            message_parts.extend([
+                "",
+                "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━",
+                f" RESTANT A PAYER : {format_montant_simple(reste)}",
+                "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━",
+                "Le client doit regler ce montant."
+            ])
+        else:
+            message_parts.append("\nLa facture est entierement couverte par les avoirs.")
+
+        for residu in residus:
+            message_parts.extend([
+                "",
+                f" NOUVEL AVOIR (residu) N{residu['numero']} : "
+                f"{format_montant_simple(residu['montant'])}",
+                ("   PDF genere et ouvert : " + residu['pdf_info']) if residu['pdf_ok']
+                else ("   PDF NON genere (" + residu['pdf_info'] + ")"),
+                "   Email de notification envoye au client" if residu['email_ok']
+                else "   Pas d'email envoye au client",
+                f"   Remettez ce nouveau bon d'avoir au client."
+            ])
+
+        if non_utilises:
+            message_parts.extend([
+                "",
+                "Avoirs NON utilises (facture deja couverte, toujours valables) : "
+                + ", ".join(non_utilises)
+            ])
+
+        if erreurs:
+            message_parts.extend(["", "Avoirs en erreur :"] + erreurs)
+
+        titre = " UTILISATION MULTI-AVOIRS REUSSIE"
+        if erreurs:
+            messagebox.showwarning(titre + " (avec erreurs)", "\n".join(message_parts))
+        else:
+            messagebox.showinfo(titre, "\n".join(message_parts))
+
+        self.db.add_log(
+            self.user[1],
+            "VALIDATION_MULTI_AVOIRS",
+            f"Facture {numero_facture} - {len(lignes_recap)} avoir(s) cumule(s) - "
+            f"Total impute: {format_montant_simple(total_impute)} - "
+            f"Restant a payer: {format_montant_simple(reste)}"
+        )
+
+        self.update_status("Utilisation multi-avoirs terminee")
+
     def setup_keyboard_shortcuts(self):
         """Configure les raccourcis clavier"""
         self.root.bind('<Control-d>', lambda e: self.show_dashboard())
